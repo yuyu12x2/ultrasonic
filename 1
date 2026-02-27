@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""
+固定距离超声回波处理（10帧CSV）
+流程：
+1) 读取示波器CSV（兼容你给的load_scope_csv格式）
+2) 去基线（滑动中值 + 早期噪声均值）
+3) S-G滤波
+4) 基于互相关的自动标定（帧间对齐）
+5) 变增益放大（TGC）
+6) 十帧归一化后求平均
+7) 动态阈值检测回波窗口
+8) 用“插值”构造FIR匹配滤波器系数（便于嵌入式）
+9) 画滤波后包络图并输出系数
+
+依赖：numpy, pandas, scipy, matplotlib
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from typing import List, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.signal import savgol_filter, hilbert, correlate, correlation_lags, lfilter
+from scipy.interpolate import interp1d
+
+
+# ---------------------------
+# 1) CSV读取（兼容你现有函数）
+# ---------------------------
+def load_scope_csv(path, fs=1e8, skiprows=27):
+    df = pd.read_csv(path, skiprows=skiprows, header=None)
+    t = df.iloc[:, 0].to_numpy(dtype=float)  # seconds
+    x = df.iloc[:, 1].to_numpy(dtype=float)
+    t_us = t * 1e6
+    return t, t_us, x, fs
+
+
+# ---------------------------
+# 2) 预处理与工具函数
+# ---------------------------
+def remove_baseline(x: np.ndarray, fs: float, baseline_us: float = 8.0) -> np.ndarray:
+    """去基线：滑动中值 + 最前段均值二次校正。"""
+    n = len(x)
+    win = int(round(baseline_us * 1e-6 * fs))
+    win = max(11, win | 1)  # 保证奇数且不过小
+
+    # 滑动中值去慢变基线
+    s = pd.Series(x)
+    base = s.rolling(window=win, center=True, min_periods=1).median().to_numpy()
+    y = x - base
+
+    # 用最前端一小段（含激励前后）估计残余直流
+    n0 = max(10, int(2e-6 * fs))
+    y = y - np.mean(y[:n0])
+    return y
+
+
+def normalize_robust(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """鲁棒归一化：按P99幅值缩放，避免被孤立尖峰完全主导。"""
+    scale = np.percentile(np.abs(x), 99)
+    return x / (scale + eps)
+
+
+def find_ringdown_end(
+    x: np.ndarray,
+    fs: float,
+    min_us: float = 3.0,
+    max_us: float = 30.0,
+    sigma_k: float = 3.0,
+) -> int:
+    """估计自振结束点：在[min_us,max_us]内，包络降到噪声阈值以下的最早点。"""
+    env = np.abs(hilbert(x))
+    i0 = int(min_us * 1e-6 * fs)
+    i1 = min(len(x), int(max_us * 1e-6 * fs))
+
+    noise = env[:max(20, i0)]
+    thr = np.median(noise) + sigma_k * 1.4826 * np.median(np.abs(noise - np.median(noise)))
+
+    idx = np.where(env[i0:i1] < thr)[0]
+    if len(idx) == 0:
+        return i0
+    return i0 + int(idx[0])
+
+
+def align_by_xcorr(
+    frames: List[np.ndarray],
+    fs: float,
+    ref_idx: int = 0,
+    search_us: float = 6.0,
+    roi_start_us: float = 20.0,
+    roi_end_us: float = 90.0,
+) -> Tuple[List[np.ndarray], np.ndarray]:
+    """基于互相关的自动标定（帧间时延对齐）。"""
+    ref = frames[ref_idx]
+    n = len(ref)
+
+    r0 = int(roi_start_us * 1e-6 * fs)
+    r1 = min(n, int(roi_end_us * 1e-6 * fs))
+    ref_roi = ref[r0:r1]
+
+    max_lag = int(search_us * 1e-6 * fs)
+
+    aligned = []
+    lags_samples = []
+
+    for x in frames:
+        x_roi = x[r0:r1]
+        c = correlate(x_roi, ref_roi, mode="full", method="fft")
+        lags = correlation_lags(len(x_roi), len(ref_roi), mode="full")
+
+        keep = np.abs(lags) <= max_lag
+        lag = lags[keep][np.argmax(c[keep])]
+
+        # lag > 0 表示x相对ref滞后，需要左移
+        x_shift = np.roll(x, -lag)
+
+        # 边界补零，避免roll环绕伪影
+        if lag > 0:
+            x_shift[-lag:] = 0.0
+        elif lag < 0:
+            x_shift[:-lag] = 0.0
+
+        aligned.append(x_shift)
+        lags_samples.append(lag)
+
+    return aligned, np.array(lags_samples, dtype=int)
+
+
+def apply_tgc(
+    x: np.ndarray,
+    fs: float,
+    start_us: float,
+    gain_db_per_us: float = 0.18,
+    max_gain_db: float = 26.0,
+) -> np.ndarray:
+    """变增益放大：从start_us开始线性dB增益，并限制最大增益。"""
+    n = len(x)
+    t_us = np.arange(n) / fs * 1e6
+    db = np.clip((t_us - start_us) * gain_db_per_us, 0.0, max_gain_db)
+    g = 10 ** (db / 20.0)
+    return x * g
+
+
+def dynamic_threshold(
+    env: np.ndarray,
+    fs: float,
+    start_idx: int,
+    win_us: float = 6.0,
+    k: float = 5.0,
+    min_gap_us: float = 1.0,
+) -> np.ndarray:
+    """动态阈值：滑窗中位数+MAD估计，返回超过阈值的mask。"""
+    n = len(env)
+    w = max(21, int(win_us * 1e-6 * fs) | 1)
+
+    s = pd.Series(env)
+    med = s.rolling(window=w, center=True, min_periods=1).median().to_numpy()
+    mad = (
+        s.rolling(window=w, center=True, min_periods=1)
+        .apply(lambda z: np.median(np.abs(z - np.median(z))), raw=True)
+        .to_numpy()
+    )
+    sigma = 1.4826 * mad
+    thr = med + k * sigma
+
+    mask = np.zeros(n, dtype=bool)
+    mask[start_idx:] = env[start_idx:] > thr[start_idx:]
+
+    # 形态学式最小连通长度约束（抑制单点噪声，如55us尖峰附近毛刺）
+    min_len = max(3, int(min_gap_us * 1e-6 * fs))
+    idx = np.where(mask)[0]
+    if len(idx) == 0:
+        return mask
+
+    runs = []
+    run_start = idx[0]
+    for i in range(1, len(idx)):
+        if idx[i] != idx[i - 1] + 1:
+            runs.append((run_start, idx[i - 1]))
+            run_start = idx[i]
+    runs.append((run_start, idx[-1]))
+
+    clean = np.zeros_like(mask)
+    for a, b in runs:
+        if b - a + 1 >= min_len:
+            clean[a : b + 1] = True
+    return clean
+
+
+def build_interp_fir_from_echo(
+    avg_wave: np.ndarray,
+    fs: float,
+    echo_center_idx: int,
+    taps: int = 81,
+    span_us: float = 8.0,
+) -> np.ndarray:
+    """基于平均回波模板，采用插值生成固定长度FIR匹配滤波器系数。"""
+    taps = taps | 1
+    half = int((span_us * 1e-6 * fs) // 2)
+
+    a = max(0, echo_center_idx - half)
+    b = min(len(avg_wave), echo_center_idx + half + 1)
+    tpl = avg_wave[a:b].copy()
+    if len(tpl) < 7:
+        raise ValueError("回波模板太短，无法构造滤波器。请放宽检测窗口或检查数据。")
+
+    # 插值到指定tap数
+    x_old = np.linspace(0, 1, len(tpl))
+    x_new = np.linspace(0, 1, taps)
+    f = interp1d(x_old, tpl, kind="cubic", fill_value="extrapolate")
+    h = f(x_new)
+
+    # 匹配滤波器：时间反转
+    h = h[::-1]
+
+    # 去直流 + 能量归一化
+    h = h - np.mean(h)
+    norm = np.sqrt(np.sum(h * h)) + 1e-12
+    h = h / norm
+    return h
+
+
+# ---------------------------
+# 3) 主流程
+# ---------------------------
+def process_files(
+    csv_files: List[Path],
+    fs: float = 100e6,
+    skiprows: int = 27,
+    sg_window: int = 31,
+    sg_poly: int = 3,
+):
+    raw_frames = []
+    t = None
+    t_us = None
+
+    # 读取 + 去基线 + SG滤波 + 归一化
+    for p in csv_files:
+        ti, ti_us, x, _ = load_scope_csv(p, fs=fs, skiprows=skiprows)
+        if t is None:
+            t, t_us = ti, ti_us
+
+        y = remove_baseline(x, fs)
+
+        w = sg_window | 1
+        if w >= len(y):
+            w = (len(y) - 1) | 1
+        y = savgol_filter(y, window_length=w, polyorder=sg_poly, mode="interp")
+
+        y = normalize_robust(y)
+        raw_frames.append(y)
+
+    # 自振结束估计（先用第一帧）
+    ring_end_idx = find_ringdown_end(raw_frames[0], fs)
+    ring_end_us = ring_end_idx / fs * 1e6
+
+    # 互相关自动标定（对齐）
+    aligned, lags = align_by_xcorr(
+        raw_frames,
+        fs,
+        ref_idx=0,
+        search_us=6.0,
+        roi_start_us=max(ring_end_us + 2.0, 15.0),
+        roi_end_us=95.0,
+    )
+
+    # TGC
+    tgc_frames = [
+        apply_tgc(x, fs, start_us=ring_end_us + 0.5, gain_db_per_us=0.16, max_gain_db=28.0)
+        for x in aligned
+    ]
+
+    # 十帧归一化求平均（你要求的叠加增强）
+    tgc_norm = [normalize_robust(x) for x in tgc_frames]
+    avg_wave = np.mean(np.stack(tgc_norm, axis=0), axis=0)
+
+    # 包络与动态阈值
+    env = np.abs(hilbert(avg_wave))
+    det_mask = dynamic_threshold(env, fs, start_idx=ring_end_idx, win_us=5.0, k=4.5, min_gap_us=0.5)
+
+    # 回波中心估计：取检测区间内包络最大值
+    valid_idx = np.where(det_mask)[0]
+    if len(valid_idx) == 0:
+        echo_idx = ring_end_idx + np.argmax(env[ring_end_idx:])
+    else:
+        echo_idx = valid_idx[np.argmax(env[valid_idx])]
+    echo_us = echo_idx / fs * 1e6
+
+    # 插值法构造FIR系数
+    fir = build_interp_fir_from_echo(avg_wave, fs, echo_idx, taps=81, span_us=8.0)
+
+    # 应用FIR匹配滤波并取包络
+    mf = lfilter(fir, [1.0], avg_wave)
+    mf_env = np.abs(hilbert(mf))
+
+    return {
+        "t": t,
+        "t_us": t_us,
+        "avg_wave": avg_wave,
+        "env": env,
+        "mf": mf,
+        "mf_env": mf_env,
+        "ring_end_idx": ring_end_idx,
+        "ring_end_us": ring_end_us,
+        "echo_idx": echo_idx,
+        "echo_us": echo_us,
+        "lags": lags,
+        "fir": fir,
+    }
+
+
+def plot_results(res: dict, out_png: Path):
+    t_us = res["t_us"]
+    avg_wave = res["avg_wave"]
+    env = res["env"]
+    mf_env = res["mf_env"]
+
+    plt.figure(figsize=(12, 7))
+
+    ax1 = plt.subplot(2, 1, 1)
+    ax1.plot(t_us, avg_wave, lw=1.0, label="平均波形(10帧, 归一化后)")
+    ax1.plot(t_us, env, lw=1.2, label="平均波形包络")
+    ax1.axvline(res["ring_end_us"], color="gray", ls="--", label=f"自振结束 ~{res['ring_end_us']:.2f} us")
+    ax1.axvline(res["echo_us"], color="r", ls="--", label=f"回波中心 ~{res['echo_us']:.2f} us")
+    ax1.set_xlabel("Time (us)")
+    ax1.set_ylabel("Amplitude")
+    ax1.grid(alpha=0.3)
+    ax1.legend(loc="upper right")
+
+    ax2 = plt.subplot(2, 1, 2, sharex=ax1)
+    ax2.plot(t_us, mf_env, color="tab:green", lw=1.2, label="匹配滤波后包络")
+    ax2.axvline(res["echo_us"], color="r", ls="--", label="回波中心")
+    ax2.set_xlabel("Time (us)")
+    ax2.set_ylabel("Envelope")
+    ax2.grid(alpha=0.3)
+    ax2.legend(loc="upper right")
+
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=180)
+    plt.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="超声回波10帧CSV处理 + 插值FIR系数生成",
+        epilog=(
+            "示例:\n"
+            "  python ultrasonic_echo_processing.py ./data\n"
+            "  python ultrasonic_echo_processing.py --input_dir ./data --pattern '*.CSV'"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "input_dir",
+        nargs="?",
+        default=".",
+        help="CSV目录（位置参数，可省略，默认当前目录）",
+    )
+    parser.add_argument(
+        "--input_dir",
+        dest="input_dir_flag",
+        type=str,
+        default=None,
+        help="CSV目录（可选参数，优先于位置参数）",
+    )
+    parser.add_argument("--pattern", type=str, default="*.csv", help="CSV匹配模式")
+    parser.add_argument("--fs", type=float, default=100e6, help="采样率，默认100MHz")
+    parser.add_argument("--skiprows", type=int, default=27, help="CSV头跳过行数")
+    parser.add_argument("--out_png", type=str, default="echo_envelope.png", help="输出图像")
+    parser.add_argument("--out_coeff", type=str, default="fir_coeffs.txt", help="输出FIR系数文本")
+    args = parser.parse_args()
+
+    input_dir = Path(args.input_dir_flag if args.input_dir_flag else args.input_dir)
+    files = sorted(input_dir.glob(args.pattern))
+
+    if len(files) < 10:
+        msg = (
+            f"至少需要10个CSV，当前找到{len(files)}个：{input_dir}/{args.pattern}\n"
+            "请这样运行：\n"
+            "  python ultrasonic_echo_processing.py ./你的CSV目录\n"
+            "或：\n"
+            "  python ultrasonic_echo_processing.py --input_dir ./你的CSV目录"
+        )
+        raise RuntimeError(msg)
+    files = files[:10]  # 只取前10帧
+
+    res = process_files(files, fs=args.fs, skiprows=args.skiprows)
+
+    # 保存系数
+    np.savetxt(args.out_coeff, res["fir"], fmt="%.10e")
+
+    # 打印嵌入式可用格式
+    fir_c = ", ".join([f"{v:.8e}f" for v in res["fir"]])
+    print("\n=== 处理结果 ===")
+    print(f"自振结束: {res['ring_end_us']:.3f} us")
+    print(f"回波中心: {res['echo_us']:.3f} us")
+    print(f"帧间对齐lags(samples): {res['lags'].tolist()}")
+    print(f"FIR taps: {len(res['fir'])}")
+    print("\n=== FIR系数(可直接复制到C数组) ===")
+    print(f"float fir[{len(res['fir'])}] = {{ {fir_c} }};")
+
+    # 作图
+    plot_results(res, Path(args.out_png))
+    print(f"\n已保存图像: {args.out_png}")
+    print(f"已保存系数: {args.out_coeff}")
+
+
+if __name__ == "__main__":
+    main()
